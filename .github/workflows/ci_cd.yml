@@ -1,0 +1,211 @@
+name: CI/CD - Korva Vitrine
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ────────────────────────────────────────────────
+  # 1. Analyse statique (SAST) — SonarQube
+  # ────────────────────────────────────────────────
+  sast:
+    name: SAST (SonarQube)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # nécessaire pour l'analyse de l'historique par SonarQube
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v4
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: Quality Gate
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # ────────────────────────────────────────────────
+  # 2. Build de l'image Docker + push registry
+  # ────────────────────────────────────────────────
+  build:
+    name: Build
+    needs: sast
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: production
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Set image output
+        id: meta
+        run: echo "image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+  # ────────────────────────────────────────────────
+  # 3. Analyse de composition (SCA) — Trivy sur l'image
+  # ────────────────────────────────────────────────
+  sca:
+    name: SCA (Trivy)
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Trivy scan (image)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ needs.build.outputs.image }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "1" # bloque le pipeline si vulnérabilité critique/haute
+
+      - name: Upload SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Upload Trivy report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: trivy-results.sarif
+
+  # ────────────────────────────────────────────────
+  # 4. Déploiement
+  # ────────────────────────────────────────────────
+  deploy:
+    name: Deploy
+    needs: sca
+    runs-on: ubuntu-latest
+    outputs:
+      url: ${{ steps.set-url.outputs.url }}
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            docker login ${{ env.REGISTRY }} -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
+            docker pull ${{ needs.build.outputs.image }}
+            docker compose -f docker-compose.yml up -d --force-recreate
+
+      - name: Set deploy URL
+        id: set-url
+        run: echo "url=${{ secrets.DEPLOY_URL }}" >> "$GITHUB_OUTPUT"
+
+  # ────────────────────────────────────────────────
+  # 5. Test dynamique (DAST) — OWASP ZAP
+  # ────────────────────────────────────────────────
+  dast:
+    name: DAST (OWASP ZAP)
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: ${{ needs.deploy.outputs.url }}
+          cmd_options: "-a"
+          fail_action: false
+
+      - name: Upload ZAP report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: report_html.html
+
+  # ────────────────────────────────────────────────
+  # 6. Envoi du rapport consolidé
+  # ────────────────────────────────────────────────
+  report:
+    name: Rapport
+    needs: [sast, build, sca, deploy, dast]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Build summary
+        run: |
+          {
+            echo "## Rapport pipeline CI/CD - Korva Vitrine"
+            echo ""
+            echo "| Job | Statut |"
+            echo "|---|---|"
+            echo "| SAST (SonarQube) | ${{ needs.sast.result }} |"
+            echo "| Build | ${{ needs.build.result }} |"
+            echo "| SCA (Trivy) | ${{ needs.sca.result }} |"
+            echo "| Deploy | ${{ needs.deploy.result }} |"
+            echo "| DAST (OWASP ZAP) | ${{ needs.dast.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Send report by email
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "Rapport pipeline CI/CD - ${{ github.repository }} - ${{ job.status }}"
+          to: ${{ secrets.REPORT_EMAIL }}
+          from: GitHub Actions
+          body: |
+            Pipeline terminé pour ${{ github.repository }} (commit ${{ github.sha }}).
+            SAST: ${{ needs.sast.result }}
+            Build: ${{ needs.build.result }}
+            SCA: ${{ needs.sca.result }}
+            Deploy: ${{ needs.deploy.result }}
+            DAST: ${{ needs.dast.result }}
+          attachments: artifacts/trivy-report/trivy-results.sarif,artifacts/zap-report/report_html.html
