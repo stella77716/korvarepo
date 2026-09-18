@@ -2,151 +2,93 @@ name: CI/CD - Korva Vitrine
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
-    types: [opened, synchronize, reopened]
+    branches: [main]
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME: korva-vitrine
+  DEPLOY_PORT: 8085
 
 jobs:
-
   sast:
-    name: sast (SonarQube)
+    name: SAST (SonarCloud)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
-      - name: SonarQube Scan
-        uses: SonarSource/sonarqube-scan-action@7006c4492b2e0ee0f816d36501671557c97f5995 # v8.1.0
+          fetch-depth: 0
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@v4
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
 
-  # ────────────────────────────────────────────────
-  # 2. Build de l'image Docker + push registry
-  # ───────────────────────────────────────────────────────────
   build:
     name: Build
     needs: sast
     runs-on: self-hosted
-    outputs:
-      image: ${{ steps.meta.outputs.image }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build --target production -t ${{ env.IMAGE_NAME }}:${{ github.sha }} -t ${{ env.IMAGE_NAME }}:latest .
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push image
-        run: |
-          docker build --target production \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest .
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-
-      - name: Set image output
-        id: meta
-        run: echo "image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
-
-  # ────────────────────────────────────────────────
-  # 3. Analyse de composition (SCA) — Trivy sur l'image
-  # ────────────────────────────────────────────────
   sca:
     name: SCA (Trivy)
     needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      security-events: write
+    runs-on: self-hosted
     steps:
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
+      - name: Install Trivy
+        run: |
+          if ! command -v trivy &> /dev/null; then
+            sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+            wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+            echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+            sudo apt-get update && sudo apt-get install -y trivy
+          fi
       - name: Trivy scan (image)
-        uses: aquasecurity/trivy-action@v0.9.0
-        with:
-          image-ref: ${{ needs.build.outputs.image }}
-          format: sarif
-          output: trivy-results.sarif
-          severity: CRITICAL,HIGH
-          exit-code: "1" # bloque le pipeline si vulnérabilité critique/haute
-
-      - name: Upload SARIF to GitHub Security
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-results.sarif
-
+        run: |
+          trivy image --severity CRITICAL,HIGH --format json --output trivy-report.json ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          trivy image --severity CRITICAL,HIGH --exit-code 1 ${{ env.IMAGE_NAME }}:${{ github.sha }}
       - name: Upload Trivy report artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: trivy-report
-          path: trivy-results.sarif
+          path: trivy-report.json
 
-  # ────────────────────────────────────────────────
-  # 4. Déploiement
-  # ────────────────────────────────────────────────
   deploy:
     name: Deploy
-    needs: [build, sca]
-    runs-on: ubuntu-latest
-    outputs:
-      url: ${{ steps.set-url.outputs.url }}
+    needs: sca
+    runs-on: self-hosted
     steps:
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          script: |
-            docker login ${{ env.REGISTRY }} -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
-            docker pull ${{ needs.build.outputs.image }}
-            docker compose -f docker-compose.yml up -d --force-recreate
+      - uses: actions/checkout@v4
+      - name: Deploy with docker compose
+        run: docker compose -f docker-compose.yml up -d --force-recreate
+        env:
+          VITRINE_PORT: ${{ env.DEPLOY_PORT }}
 
-      - name: Set deploy URL
-        id: set-url
-        run: echo "url=${{ secrets.DEPLOY_URL }}" >> "$GITHUB_OUTPUT"
-
-  # ────────────────────────────────────────────────
-  # 5. Test dynamique (DAST) — OWASP ZAP
-  # ────────────────────────────────────────────────
   dast:
     name: DAST (OWASP ZAP)
     needs: deploy
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - name: ZAP Baseline Scan
-        uses: zaproxy/action-baseline@v0.12.0
-        with:
-          target: ${{ needs.deploy.outputs.url }}
-          cmd_options: "-a"
-          fail_action: false
-
+        run: |
+          docker run --rm --network host \
+            -v $(pwd):/zap/wrk/:rw \
+            zaproxy/zap-stable zap-baseline.py \
+            -t http://localhost:${{ env.DEPLOY_PORT }} \
+            -J zap-report.json -r zap-report.html || true
       - name: Upload ZAP report artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: zap-report
-          path: report_html.html
+          path: |
+            zap-report.json
+            zap-report.html
 
-  # ────────────────────────────────────────────────
-  # 6. Envoi du rapport consolidé
-  # ────────────────────────────────────────────────
   report:
     name: Rapport
     needs: [sast, build, sca, deploy, dast]
@@ -157,7 +99,6 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-
       - name: Build summary
         run: |
           {
@@ -165,13 +106,12 @@ jobs:
             echo ""
             echo "| Job | Statut |"
             echo "|---|---|"
-            echo "| SAST (SonarQube) | ${{ needs.sast.result }} |"
+            echo "| SAST (SonarCloud) | ${{ needs.sast.result }} |"
             echo "| Build | ${{ needs.build.result }} |"
             echo "| SCA (Trivy) | ${{ needs.sca.result }} |"
             echo "| Deploy | ${{ needs.deploy.result }} |"
             echo "| DAST (OWASP ZAP) | ${{ needs.dast.result }} |"
           } >> "$GITHUB_STEP_SUMMARY"
-
       - name: Send report by email
         if: always()
         uses: dawidd6/action-send-mail@v3
@@ -190,4 +130,4 @@ jobs:
             SCA: ${{ needs.sca.result }}
             Deploy: ${{ needs.deploy.result }}
             DAST: ${{ needs.dast.result }}
-          attachments: artifacts/trivy-report/trivy-results.sarif,artifacts/zap-report/report_html.html
+          attachments: artifacts/trivy-report/trivy-report.json,artifacts/zap-report/zap-report.html
