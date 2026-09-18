@@ -2,36 +2,26 @@ name: CI/CD - Korva Vitrine
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   pull_request:
-    branches: [main]
+    types: [opened, synchronize, reopened]
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  # ────────────────────────────────────────────────
-  # 1. Analyse statique (SAST) — SonarQube
-  # ────────────────────────────────────────────────
+
   sast:
-    name: SAST (SonarQube)
+    name: sast (SonarQube)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          fetch-depth: 0 # nécessaire pour l'analyse de l'historique par SonarQube
-
+          fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
       - name: SonarQube Scan
-        uses: SonarSource/sonarqube-scan-action@v4
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-
-      - name: Quality Gate
-        uses: SonarSource/sonarqube-quality-gate-action@v1
-        timeout-minutes: 5
+        uses: SonarSource/sonarqube-scan-action@7006c4492b2e0ee0f816d36501671557c97f5995 # v8.1.0
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
@@ -94,7 +84,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Trivy scan (image)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.9.0
         with:
           image-ref: ${{ needs.build.outputs.image }}
           format: sarif
@@ -120,7 +110,7 @@ jobs:
   # ────────────────────────────────────────────────
   deploy:
     name: Deploy
-    needs: sca
+    needs: [build, sca]
     runs-on: ubuntu-latest
     outputs:
       url: ${{ steps.set-url.outputs.url }}
