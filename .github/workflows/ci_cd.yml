@@ -40,7 +40,7 @@ jobs:
     steps:
       - name: Install Trivy
         run: |
-           if ! command -v trivy &> /dev/null; then
+          if ! command -v trivy &> /dev/null; then
             curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
           fi
       - name: Trivy scan (image)
