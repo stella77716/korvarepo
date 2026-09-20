@@ -38,23 +38,21 @@ jobs:
     needs: build
     runs-on: self-hosted
     steps:
-      - name: Install Trivy
-        run: |
-          if ! command -v trivy &> /dev/null; then
-            curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b "$HOME/.local/bin" v0.58.1
-          fi
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Trivy scan (image)
-        run: |
-          trivy image --severity CRITICAL,HIGH --format json --output trivy-report.json ${{ env.IMAGE_NAME }}:${{ github.sha }}
-          trivy image --severity CRITICAL,HIGH --exit-code 1 ${{ env.IMAGE_NAME }}:${{ github.sha }}
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: json
+          output: trivy-report.json
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+
       - name: Upload Trivy report artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: trivy-report
           path: trivy-report.json
-
   deploy:
     name: Deploy
     needs: sca
