@@ -72,7 +72,10 @@ jobs:
           VITE_API_URL=https://api.votre-domaine.com
           VITE_VITRINE_API_TOKEN=${{ secrets.VITE_VITRINE_API_TOKEN }}
           EOF
-
+      
+      - name: Nettoyer les anciens conteneurs
+        run: |
+          docker rm -f $(docker ps -aq --filter "name=korva-vitrine") 2>/dev/null || true
       - name: Deploy with docker compose
         run: docker compose -f docker-compose.yml up -d --force-recreate
 
