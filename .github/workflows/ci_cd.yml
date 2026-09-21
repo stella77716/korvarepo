@@ -59,10 +59,22 @@ jobs:
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
+
+      - name: Créer le .env
+        run: |
+          cat > .env << EOF
+          VITRINE_PORT=${{ env.DEPLOY_PORT }}
+          VITRINE_DEV_PORT=5174
+          VITE_ALIBORA_URL=https://alibora.com/
+          VITE_KORVA_SOLUTION_URL=https://alibora.com/solutions/korva-accounting-software
+          VITE_SUPPORT_EMAIL=support@alibora.com
+          VITE_REGISTRATION_EMAIL=support@alibora.com
+          VITE_API_URL=https://api.votre-domaine.com
+          VITE_VITRINE_API_TOKEN=${{ secrets.VITE_VITRINE_API_TOKEN }}
+          EOF
+
       - name: Deploy with docker compose
         run: docker compose -f docker-compose.yml up -d --force-recreate
-        env:
-          VITRINE_PORT: ${{ env.DEPLOY_PORT }}
 
   dast:
     name: DAST (OWASP ZAP)
